@@ -4,7 +4,7 @@ A firsthand, reproducible comparison of **"managed agents" vs running the agent 
 
 Run 2026-06-01 by [Paweł Huryn](https://www.productcompass.pm). Every claim is backed by the run logs in [`data/`](data/). Inspect the artifacts, don't trust screenshots.
 
-> **TL;DR** — Running the agent loop locally was cheaper than the managed runtime on all three providers, but by wildly different margins (≈equal / ~5× / ~16×), and "managed agent" isn't even the same product across vendors. Google and Anthropic sell a managed-agent runtime; OpenAI doesn't (its Responses API loops over its own hosted tools, but there's no standalone managed-agent product).
+> **TL;DR** — "Managed agent" isn't even the same product across these three. Google and Anthropic both expose a persistent agent you invoke by ID over REST, so I benchmarked them against running the loop locally: Google ~5.3× the cost (4.8× slower), Anthropic ~1.1× (about equal, 2.7× slower). OpenAI has a managed *workflow* (Agent Builder) too, but no headless run-by-ID API yet (ChatKit-only) — so it isn't benchmarkable the same way. The OpenAI path I could measure (Responses + code_interpreter) is a hosted tool, not the managed workflow. The portable constant across all of it is the agent definition.
 
 ## First: "managed agent" means three different things
 
@@ -14,7 +14,7 @@ This is the part most comparisons skip. The providers are not offering the same 
 |---|---|
 | **Google** — Managed Agents (`/v1beta/interactions`) | A real managed runtime. You register an agent; Google provisions a Linux sandbox and runs the **entire multi-step loop** server-side (reason → call tool → run code → observe → repeat → answer). One request, they do every step. Persistent agents, sessions, environments. |
 | **Anthropic** — Managed Agents (`/v1/agents` + `/v1/sessions`) | Also a real managed runtime. A container per session, the full loop on Anthropic's orchestration layer, streamed events. Plus success-criteria graders, a Vaults secrets API, and subagents. |
-| **OpenAI** — *no standalone product* | The **Responses API** *does* run a server-side loop over its **hosted tools** (a `code_interpreter` sandbox iterates until done in a managed container). What's missing vs the other two is a **persistent managed-agent product** (named agent + session + environment objects). The stateful **Assistants API** (closest to that) is **deprecated, sunset 2026-08-26**. **AgentKit** is a visual builder, not a run-my-agent runtime. |
+| **OpenAI** — *managed workflow, but not headlessly runnable* | **Agent Builder** (AgentKit) lets you build a workflow and **publish it as a persistent, OpenAI-hosted object** (workflow ID). But you can only invoke it via **ChatKit** (a chat-session wrapper) — there is **no headless run-by-ID REST API yet** (a standalone Workflows API is "coming soon"; `/v1/workflows/{id}/run` returns 400 as of June 2026). Separately, the Responses API runs a server-side loop over its hosted tools (e.g. `code_interpreter`). The stateful **Assistants API** is **deprecated, sunset 2026-08-26**. |
 
 So when this repo says "managed" for OpenAI, it means *one Responses call with a hosted code tool* — not a managed agent loop. That distinction drives the cost result below.
 
@@ -26,7 +26,7 @@ Fair test: the provider's managed runtime vs a loop on my own machine (model via
 |---|---|---|---|---|
 | Anthropic (claude-haiku-4-5) | full managed loop + container | **~1.1× (about equal)** | managed 2.7× slower | caching keeps managed close |
 | Google (gemini-3.5-flash) | full managed loop + cloud sandbox | **~5.3× more** | managed 4.8× slower | flat tax for the always-on sandbox |
-| OpenAI (gpt-5-mini) | Responses loops over its hosted code tool; no persistent product | **~16× more** | faster (0.7×) | the `code_interpreter` container fee, not tokens (hosted-tool economics, not managed-agent) |
+| OpenAI (gpt-5-mini) | Agent Builder workflow (hosted) — but no headless run API, ChatKit-only | not benchmarked* | — | *the measurable path (Responses + `code_interpreter`) is a hosted tool, not the managed workflow; it ran ~16× my local code path (container fee) |
 
 Plus: a single agent **definition** (instructions + `SKILL.md` + files) ran on Google's managed cloud sandbox **and** on Claude locally and caught the same bug; one `AGENTS.md` format rule was obeyed 100% across Google Managed Agents, Gemini direct, and Claude. The portable thing is the definition; the runtime is a deploy choice.
 
