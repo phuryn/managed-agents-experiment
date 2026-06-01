@@ -8,7 +8,7 @@ Caching reported as-measured (managed auto-caches its context; local context is 
 Providers: Google (gemini-3.5-flash), Anthropic (claude-haiku-4-5), OpenAI (gpt-5-mini).
 Same T1-T3 tasks + graders. Writes data/clean_runs.jsonl + outputs/comparison-clean.md
 """
-import argparse, json, os, subprocess, sys, tempfile, time
+import argparse, json, os, subprocess, sys, tempfile, time, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gemini_client as gc
@@ -22,7 +22,11 @@ A_BETA = ["managed-agents-2026-04-01"]
 GEM_MODEL, ANT_MODEL, OAI_MODEL = "gemini-3.5-flash", "claude-haiku-4-5", "gpt-5-mini"
 PRICE = {"gem": (0.30, 2.50), "ant": (1.00, 5.00), "oai": (0.25, 2.00)}  # ($/1M in,out) estimates
 aclient = anthropic.Anthropic(api_key=gc._load_key("ANTHROPIC_API_KEY"))
-oclient = OpenAI(api_key=gc._load_key("OPENAI_API_KEY"))
+OAI_KEY = gc._load_key("OPENAI_API_KEY")
+oclient = OpenAI(api_key=OAI_KEY)
+# Pawel's real Agent Builder workflow (gpt-5-mini + code_interpreter, medium reasoning),
+# published + invoked headlessly by ID via POST /v1/workflows/{id}/run.
+OAI_WORKFLOW_ID = "wf_68f0aace15ec8190ac50ebb281f7af700abfb51ee810a303"
 
 # ---------------- local tool executor ----------------
 def run_python(code):
@@ -155,13 +159,53 @@ def managed_anthropic(task):
     cost = (inp * pin + out * pout + cc * pin * 1.25 + cr * pin * 0.10) / 1e6
     return {"text": " ".join(texts), "in_tok": inp + cc + cr, "out_tok": out, "cost": cost, "latency": round(elapsed, 2), "used_tool": used}
 
+def _oai_walk(o, found):
+    """Pull usage + output_text + code-tool signal out of a streamed workflow event."""
+    if isinstance(o, dict):
+        if isinstance(o.get("usage"), dict) and o["usage"].get("total_tokens"):
+            found["usage"] = o["usage"]
+        if o.get("type") == "output_text" and isinstance(o.get("text"), str):
+            found.setdefault("texts", []).append(o["text"])
+        # ACTUAL tool call (an output item), not the tool definition in the config event
+        if "code_interpreter_call" in str(o.get("type", "")):
+            found["used"] = True
+        for v in o.values():
+            _oai_walk(v, found)
+    elif isinstance(o, list):
+        for v in o:
+            _oai_walk(v, found)
+
 def managed_openai(task):
+    """REAL hosted Agent Builder workflow: OpenAI runs the loop server-side, invoked by ID.
+    Stream the run to recover usage + output (the non-streaming result.output is unmapped/null)."""
     t0 = time.time()
-    r = oclient.responses.create(model=OAI_MODEL, input=task, tools=[{"type": "code_interpreter", "container": {"type": "auto"}}])
+    body = {"input_data": {"input": [{"role": "user", "content": [{"type": "input_text", "text": task}]}],
+                           "input_as_text": task}, "stream": True}
+    req = urllib.request.Request("https://api.openai.com/v1/workflows/" + OAI_WORKFLOW_ID + "/run",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Authorization": "Bearer " + OAI_KEY, "Content-Type": "application/json",
+                                          "OpenAI-Beta": "workflows=v1", "Accept": "text/event-stream"})
+    found = {}
+    try:
+        r = urllib.request.urlopen(req, timeout=300)
+        for raw in r:
+            s = raw.decode("utf-8", "replace").strip()
+            if not s.startswith("data:"):
+                continue
+            try:
+                d = json.loads(s[5:].strip())
+            except Exception:
+                continue
+            _oai_walk(d, found)
+    except urllib.error.HTTPError as e:
+        return {"text": "", "in_tok": 0, "out_tok": 0, "cost": 0, "latency": round(time.time() - t0, 2),
+                "used_tool": False, "error": ("HTTP %s: %s" % (e.code, e.read().decode()[:150]))}
     elapsed = time.time() - t0
-    text = getattr(r, "output_text", "") or ""
-    used = any(getattr(o, "type", "") == "code_interpreter_call" for o in (getattr(r, "output", []) or []))
-    inp = r.usage.input_tokens; out = r.usage.output_tokens
+    u = found.get("usage", {})
+    inp = u.get("input_tokens", 0); out = u.get("output_tokens", 0)
+    texts = found.get("texts", [])
+    text = max(texts, key=len) if texts else ""
+    used = found.get("used", False)
     pin, pout = PRICE["oai"]
     cost = (inp * pin + out * pout) / 1e6 + (0.03 if used else 0)
     return {"text": text, "in_tok": inp, "out_tok": out, "cost": cost, "latency": round(elapsed, 2), "used_tool": used}

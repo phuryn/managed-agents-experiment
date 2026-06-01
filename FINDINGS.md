@@ -75,24 +75,45 @@ Recommendation: A and B are the two strongest standalone posts, both fully backe
 ## L. WHAT "MANAGED AGENT" MEANS PER PROVIDER (2026-06-01, Pawel pressure-test) — they are NOT the same kind of thing
 - **Google Managed Agents** (`/v1beta/interactions`): a real managed runtime. Provisions a Linux sandbox, runs the FULL multi-step loop server-side, returns the trace. Persistent agents/sessions/environments. = "give us your agent, we run the whole loop."
 - **Anthropic Managed Agents** (`/v1/agents` + `/v1/sessions`): a real managed runtime. Container per session, full loop on Anthropic's orchestration layer, streamed events. Plus graders/vaults/subagents. = "give us your agent, we run the whole loop."
-- **OpenAI: HAS a managed workflow product (Agent Builder/AgentKit), but it is NOT headlessly invocable, and my cost arm tested the WRONG product (workflow fact-check 2026-06-01).** Agent Builder lets you build a workflow visually and PUBLISH it as a persistent, OpenAI-hosted, versioned object (workflow_id). BUT the only programmatic way to invoke it today is the ChatKit sessions API (`/v1/chatkit/sessions`, a chat-session wrapper) — there is NO headless run-by-ID REST endpoint (OpenAI Support 2025-12-08: "not possible to call an agentkit workflow via API ... simple API flow very soon"; `/v1/workflows/{id}/run` -> 400; NOT confirmed GA as of June 2026). So unlike Google (`/v1beta/agents`+`/interactions`) and Anthropic (`/v1/agents`+`/v1/sessions`), OpenAI's managed workflow can't be benchmarked headlessly. **CRITICAL:** my OpenAI "managed" arm tested **Responses + code_interpreter** — a hosted TOOL, NOT the Agent Builder managed workflow. So the ~16x is code_interpreter container-fee / tool economics, NOT OpenAI managed-agent economics. The managed-vs-local head-to-head is therefore **Google + Anthropic only**; OpenAI is qualitative (managed workflow exists, not headlessly runnable). Assistants API deprecated, sunset 2026-08-26. Sources: developers.openai.com/api/docs/guides/agent-builder + /chatkit, cookbook agentkit walkthrough, community.openai.com calling-an-agentkit-workflow-via-api.
-- **Implication for the comparison:** Google/Anthropic columns = managed-loop-vs-local (apples to apples). OpenAI column = hosted-code-tool-vs-local-code-exec (the 16x is the code_interpreter container fee, not a managed-runtime tax). The post + README + infographic must explain this per-provider, not call all three "managed."
+- **OpenAI: HAS a managed workflow product (Agent Builder/AgentKit) AND a headless run-by-ID API — CONFIRMED empirically 2026-06-01 (the "coming soon" shipped; Pawel was right).** Agent Builder lets you build a workflow visually and PUBLISH it as a persistent, OpenAI-hosted, versioned object (`wf_...`). It is callable headlessly: **`POST /v1/workflows/{wf_id}/run`**, body **`{"input_data": {"input": "<string or array of input items>"}}`**, header `OpenAI-Beta: workflows=v1` (API stated: "For chat workflows, input_data must be an object with required key 'input' of type string or array of input items"). Returns a `workflow_run` object (id/status/result/session_id). Versioned (omit version -> production; or `version="1"`). Also invocable via ChatKit sessions (chat-shaped) and exportable as Agents SDK code (self-host). So ALL THREE providers now have a headless managed run-by-ID API — the earlier "OpenAI is the odd one out / not headlessly runnable" framing is WRONG.
+- **RESOLVED 2026-06-01 — the hosted workflow runs and is now benchmarked (§K-v2).** Two blockers, both cleared: (1) **access** — the 2nd project-matched `sk-proj-` key fixed the 404. (2) **input wiring** — runs were returning `status: failed` ("agent node: no input items ... conversation history is empty"). Pawel re-wired the start input into the agent node in Agent Builder; that flipped runs to `completed`, but `result.output` was still null AND the agent's instructions resolved to `"You are a helpful assistant. "` (the `{{workflow.input_as_text}}` template was empty). **The fix (Pawel called it): set the workflow variable `input_as_text` in the request body, ALONGSIDE `input`.** Working call:
+  ```
+  POST https://api.openai.com/v1/workflows/{wf_id}/run
+  headers: OpenAI-Beta: workflows=v1
+  body: {"input_data": {"input": [{"role":"user","content":[{"type":"input_text","text": TASK}]}],
+                        "input_as_text": TASK}, "stream": true}
+  ```
+  Two gotchas: the **non-streaming** response exposes neither usage nor output (`result.output` is null — the workflow's end-node mapping isn't returning it), so you MUST `stream: true` and parse `workflow.node.agent.response` events for `usage` + `output_text`. And detect actual code use by `code_interpreter_call` OUTPUT items, not the string `code_interpreter` (which also appears in the tool *definition* in the config event — false positive).
+- **Implication for the comparison (UPDATED):** all three columns are now managed-loop-vs-local, apples to apples. OpenAI is NOT a flat code-tool tax — it's bimodal: ~1x local when the model reasons, +$0.03 container only when it fires code. See §K-v2 per-task table. The post + README + infographic explain the THREE pricing models (Google sandbox tax / Anthropic ~none / OpenAI per-code-fee), not "all three managed cost X."
 - Sources: openai.com/index/new-tools-for-building-agents, introducing-agentkit; Assistants API deprecation (sunset 2026-08-26).
 
-## K. CLEAN comparison (2026-06-01) — managed loop vs TRUE local loop, confounds fixed. AUTHORITATIVE.
-Report: `outputs/comparison-clean.md`. Data: `data/clean_runs.jsonl`. Code: `scripts/clean_comparison.py` (real native-tool-use local loops for all 3 providers; code runs locally via subprocess = free; managed = provider sandbox loop). N=8/cell, same T1-T3, 100% pass everywhere. ~150 runs, $0.50.
+## K. CLEAN comparison (2026-06-01, v2 — REAL OpenAI hosted workflow) — managed loop vs TRUE local loop. AUTHORITATIVE.
+Report: `outputs/comparison-clean.md`. Data: `data/clean_runs.jsonl`. Code: `scripts/clean_comparison.py`. N=6/cell, same T1-T3, 108 runs, 100% pass everywhere, $0.37.
+**v2 change:** the OpenAI managed arm is now the REAL hosted Agent Builder workflow (`wf_68f0aace...`) invoked headlessly via `POST /v1/workflows/{id}/run` — NOT the Responses+code_interpreter proxy used in v1. See §L for how it was unblocked (`input_as_text` variable + node wiring). All three arms are now true managed run-by-ID loops.
 
+**Per-provider average (managed vs local):**
 | Provider | managed $ | local $ | cost (managed/local) | managed lat | local lat | latency |
 |---|---|---|---|---|---|---|
-| Anthropic (haiku-4.5) | $0.00250 | $0.00225 | **1.1x (~equal)** | 6.52s | 2.38s | managed 2.7x slower |
-| Google (gemini-3.5-flash) | $0.00416 | $0.00079 | **5.3x** | 12.14s | 2.54s | managed 4.8x slower |
-| OpenAI (gpt-5-mini) | $0.01054 | $0.00066 | **16.1x** | 3.74s | 5.61s | managed 0.7x (FASTER) |
+| Anthropic (haiku-4.5) | $0.00255 | $0.00221 | **1.2x (~equal)** | 5.99s | 2.12s | managed 2.8x slower |
+| Google (gemini-3.5-flash) | $0.00403 | $0.00077 | **5.3x** | 12.3s | 2.88s | managed 4.3x slower |
+| OpenAI (gpt-5-mini) | $0.01060 | $0.00065 | **16.4x (AVG — misleading, see below)** | 6.69s | 5.78s | managed 1.2x slower |
 
-**Corrected findings (supersede §I/§J cost claims):**
-- Running the loop LOCALLY is cheaper on all three (local tools = free CPU; you skip the provider sandbox/loop overhead). Magnitude varies hugely by vendor architecture: Anthropic ~neutral (its auto-caching keeps managed close), Google ~5x flat tax, OpenAI ~16x (driven by the code_interpreter container fee ~$0.03/use, NOT tokens — without it, OpenAI managed ~= local on tokens).
-- Latency does NOT track cost: Google + Anthropic managed are 2.7-4.8x SLOWER; OpenAI managed is FASTER (0.7x) because its code runs server-side vs my local round-trips.
-- RETRACTED: "Anthropic managed is cheaper / inverse of Google" (was a caching artifact). Corrected: ~cost-neutral, slower.
-- Caveats: cost = token estimate at tier rates + OpenAI $0.03 container estimate; managed auto-caches its big context, local context is lean (reported as-used); local loops chose to run code more often (100% vs managed 33-67%); tasks within capability (100% pass), so no reliability-cliff data.
+**The average hides the real finding. Per-task (managed/local cost ratio), with whether the agent ran code:**
+| Task | runs code? | Google | Anthropic | OpenAI |
+|---|---|---|---|---|
+| T1 prime-sum | yes (all) | 7.0x | 1.3x | **~65x** ($0.0306 vs $0.0005 — the $0.03 container fee) |
+| T2 mean-of-squares | OpenAI/Anth: no; Google: yes | 8.0x | 1.6x | **~1.0x** ($0.00073 vs $0.00072) |
+| T3 bat&ball (pure reasoning) | no (all) | **2.9x** | 0.7x | **~0.6x** (cheaper than local) |
+
+**Findings (supersede §I/§J and §K-v1):**
+- **"Managed" is not one cost. It is three different pricing bets:**
+  - **Google = sandbox tax.** ~5x on average, and crucially **still 2.9x on T3 where NO code runs.** You rent an always-on sandbox + a heavier agent context; you pay whether or not the agent executes anything. Flat runtime tax.
+  - **Anthropic = ~no tax.** ~1.2x avg, and *cheaper* than local on T3. Auto-caching of the agent context absorbs the managed overhead. You pay for the model, not the orchestration.
+  - **OpenAI = code tax.** ~1x (== local, sometimes cheaper) on reasoning tasks; +$0.03 flat container fee ONLY when the model fires `code_interpreter` (~65x on the one task that ran code). Not a runtime tax — a per-code-execution tool fee. The "16.4x average" is just one code-firing task dragging up two near-free ones.
+- **The model decides whether to run code.** For these within-capability tasks gpt-5-mini solved T2/T3 in reasoning (no container, no fee) and only fired code on T1. So OpenAI's managed cost is workload-dependent, not fixed.
+- Latency: managed slower everywhere; Google worst (12-16s, sandbox provisioning), Anthropic ~6s, OpenAI ~== local on reasoning tasks but ~19s on the code task (container spin-up).
+- RETRACTED earlier framings: "Anthropic managed cheaper/inverse" (caching artifact, §J); "OpenAI managed is a flat 16x tax" (§K-v1 — it was the Responses *proxy* + an averaging artifact; the real hosted workflow is bimodal).
+- Caveats: cost = token estimate at tier rates + OpenAI $0.03 container estimate + Anthropic cache pricing; managed auto-caches its big context, local context is lean (as-used); tasks within capability (100% pass) so this is a cost/latency/architecture finding, NOT a reliability-cliff result.
 
 ## J. CONFOUNDS (2026-06-01, Pawel pressure-test) — the cost comparison is NOT clean. Do not publish the cost claims as-is.
 1. **Caching not held constant -> "Anthropic managed cheaper" is an ARTIFACT.** Prompt caching is the standard 5-min ephemeral cache, a PLAIN-API feature. Verified firsthand: a plain `messages.create` with `cache_control` on a >2048-token (Haiku minimum) system prefix -> call 1 cache_create=5202, calls 2-3 cache_read=5202, input 15. The managed agent auto-caches its big context; my DIY single arm set no cache_control, so it paid full price. Fair comparison (both cache) -> the 0.5x advantage largely disappears. RETRACT "Anthropic managed is cheaper / inverse of Google." Likely the Google 5x is also caching-confounded (not controlled).
